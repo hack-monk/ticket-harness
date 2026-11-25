@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# ticket-log: append a dated entry to the ticket's work log, or set its status.
+# The script stamps the time so the agents never have to guess the date.
+set -euo pipefail
+
+self="$0"
+while [ -L "$self" ]; do
+  t=$(readlink "$self")
+  case "$t" in /*) self="$t" ;; *) self="$(dirname "$self")/$t" ;; esac
+done
+TH_HOME="$(cd "$(dirname "$self")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$TH_HOME/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ticket-log "<title>" [body]            Append a work-log entry. Body can also come on stdin.
+  ticket-log --status <state> [note]     Set STATUS.md and log the change.
+
+States: new, planning, in-progress, review, waiting, done
+
+Options:
+  --role <name>     Who is writing (default: $TICKET_ROLE)
+  --ticket <KEY>    Ticket to write to (default: $TICKET_KEY)
+
+Examples:
+  ticket-log "T2 done" <<'BODY'
+  - Added grants module (terraform/grants.tf)
+  - Verified with: terraform plan (2 to add, 0 to change)
+  BODY
+  ticket-log --status waiting "platform team to confirm catalog name"
+EOF
+}
+
+role="${TICKET_ROLE:-}"
+status=""
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --role)   [ $# -ge 2 ] || die "--role needs a value"; role="$2"; shift 2 ;;
+    --ticket) [ $# -ge 2 ] || die "--ticket needs a value"; TICKET_KEY="$2"; TICKET_DIR=""; shift 2 ;;
+    --status) [ $# -ge 2 ] || die "--status needs a state"; status="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+
+ticket_ctx
+[ -n "$role" ] || role="unknown"
+stamp=$(now)
+log="$TICKET_DIR/log.md"
+[ -f "$log" ] || printf '# %s work log\n' "$TICKET_KEY" > "$log"
+
+if [ -n "$status" ]; then
+  case "$status" in
+    new|planning|in-progress|review|waiting|done) ;;
+    *) die "unknown state '$status' (use: new, planning, in-progress, review, waiting, done)" ;;
+  esac
+  note=""
+  if [ ${#args[@]} -gt 0 ]; then note="${args[*]}"; fi
+  note=$(printf '%s' "$note" | tr '\n' ' ')
+  printf 'status: %s\nupdated: %s\nnote: %s\n' "$status" "$stamp" "$note" > "$TICKET_DIR/STATUS.md"
+  {
+    printf '\n## %s · %s · status → %s\n' "$stamp" "$role" "$status"
+    if [ -n "$note" ]; then printf '\n%s\n' "$note"; fi
+  } >> "$log"
+  printf 'status set: %s\n' "$status"
+  exit 0
+fi
+
+[ ${#args[@]} -ge 1 ] || { usage >&2; exit 2; }
+title=$(printf '%s' "${args[0]}" | tr '\n' ' ')
+[ -n "$title" ] || die "the title is empty"
+
+body=""
+if [ ${#args[@]} -ge 2 ]; then
+  body="${args[1]}"
+elif [ ! -t 0 ]; then
+  body=$(cat)
+fi
+
+{
+  printf '\n## %s · %s · %s\n' "$stamp" "$role" "$title"
+  if [ -n "$body" ]; then printf '\n%s\n' "$body"; fi
+} >> "$log"
+printf 'logged: %s\n' "$title"

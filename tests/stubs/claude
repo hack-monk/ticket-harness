@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Stand-in for the claude CLI used by tests/run.sh.
+set -euo pipefail
+S="${STUB_DIR:?}"
+mkdir -p "$S"
+printf '%s\n' "$*" >> "$S/claude-calls.log"
+case "$*" in
+  *--version*) echo "2.1.300 (stub)" ;;
+  *triage.md*) cat > "$S/triage-stdin"; echo "${STUB_TRIAGE:-large}" ;;
+  *standup.md*) cat > "$S/standup-stdin"; printf 'Yesterday\nSTUB UPDATE\n' ;;
+  *) echo "stub claude: unhandled: $*" >&2; exit 2 ;;
+esac

@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# ticket-dispatch: hand one task from the plan to the coder pane.
+# Run by the lead. It sends a single prompt and returns; it does not wait,
+# because the human is watching the coder and decides when to review.
+set -euo pipefail
+
+self="$0"
+while [ -L "$self" ]; do
+  t=$(readlink "$self")
+  case "$t" in /*) self="$t" ;; *) self="$(dirname "$self")/$t" ;; esac
+done
+TH_HOME="$(cd "$(dirname "$self")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$TH_HOME/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ticket-dispatch <task-id> [note...]
+
+  ticket-dispatch T1
+  ticket-dispatch T1 "fix: the grant must be on the schema, not the catalog"
+
+Options:
+  --force           Send even if the coder is still working (it will queue)
+  --ticket <KEY>    Ticket to use (default: $TICKET_KEY)
+EOF
+}
+
+force=0
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --force)  force=1; shift ;;
+    --ticket) [ $# -ge 2 ] || die "--ticket needs a value"; TICKET_KEY="$2"; TICKET_DIR=""; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+[ ${#args[@]} -ge 1 ] || { usage >&2; exit 2; }
+
+ticket_ctx
+need herdr; need jq
+
+task="${args[0]}"
+printf '%s' "$task" | grep -Eq '^[A-Za-z0-9._-]+$' || die "task id must be like T1"
+note=""
+if [ ${#args[@]} -ge 2 ]; then
+  note=$(printf '%s ' "${args[@]:1}" | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+fi
+
+plan="$TICKET_DIR/plan.md"
+[ -f "$plan" ] || die "no plan file at $plan"
+task_re=$(printf '%s' "$task" | sed 's/\./\\./g')
+grep -Eq "^#{1,6}[[:space:]]+Task[[:space:]]+${task_re}([^A-Za-z0-9._-]|\$)" "$plan" \
+  || die "no '## Task $task' heading in $plan"
+
+name="$(slug_of "$TICKET_KEY")-coder"
+status=$(agent_status "$name")
+case "$status" in
+  missing) die "the coder ($name) is not running. Start it with: ticket $TICKET_KEY --size large" ;;
+  blocked) die "the coder is waiting on a question in its pane. The human has to answer it there first." ;;
+  working) [ "$force" -eq 1 ] || die "the coder is still working. Wait for it to finish, or pass --force to queue this behind its current work." ;;
+esac
+
+msg="[from the lead] Ticket $TICKET_KEY, team mode. Implement Task $task from $plan. Read that task's whole spec before you start and follow it as written."
+if [ -n "$note" ]; then msg="$msg Note from the lead: $note."; fi
+msg="$msg When you finish or get blocked, record it with ticket-log (title '$task done' or '$task blocked') and stop."
+
+herdr agent prompt "$name" "$msg" >/dev/null \
+  || die "herdr reported an error sending the prompt. Check the coder pane before retrying; it may still have been delivered."
+
+body="Sent to $name."
+if [ -n "$note" ]; then body="$body Note: $note"; fi
+TICKET_KEY="$TICKET_KEY" TICKET_DIR="$TICKET_DIR" \
+  "$TH_HOME/bin/ticket-log" --role lead "$task dispatched" "$body" >/dev/null
+
+printf 'Dispatched %s to %s (coder was %s).\n' "$task" "$name" "$status"
+printf 'The human is watching that pane. Review when they say it is done; do not wait or poll.\n'

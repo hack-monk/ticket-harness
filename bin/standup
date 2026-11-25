@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# standup: turn the ticket folders into a standup update.
+# The gathering is plain shell; the model only condenses what was gathered.
+set -euo pipefail
+
+self="$0"
+while [ -L "$self" ]; do
+  t=$(readlink "$self")
+  case "$t" in /*) self="$t" ;; *) self="$(dirname "$self")/$t" ;; esac
+done
+TH_HOME="$(cd "$(dirname "$self")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$TH_HOME/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  standup [--since YYYY-MM-DD] [--raw]
+
+  With no options, covers everything since the last day (before today) that
+  has any log or comms entry, so Monday picks up Friday.
+
+  --since DATE   Cover from this date instead
+  --raw          Print the gathered material without calling Claude
+EOF
+}
+
+since=""
+raw=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --since) [ $# -ge 2 ] || die "--since needs a date"; since="$2"; shift 2 ;;
+    --raw)   raw=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+if [ -n "$since" ]; then
+  printf '%s' "$since" | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' || die "--since must be YYYY-MM-DD"
+fi
+
+[ -f "$TH_INDEX" ] || die "no tickets recorded yet. Open one with: ticket <KEY>"
+today=$(today)
+
+# Entry headings look like "## 2026-11-13 10:40 · coder · T2 done" (work log)
+# and "### 2026-11-13 10:40 · Slack #x · SENT · me" (comms).
+entry_dates() { # <file>
+  [ -f "$1" ] || return 0
+  sed -n 's/^##\{1,2\} \([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\) [0-9]\{2\}:[0-9]\{2\} .*/\1/p' "$1"
+}
+
+# Entries are append-only and in time order, so print from the first entry on
+# or after the date through to the end of the file.
+entries_since() { # <file> <date>
+  [ -f "$1" ] || return 0
+  awk -v d="$2" '
+    /^###? [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9] / {
+      split($0, parts, " ")
+      if (parts[2] >= d) on = 1
+    }
+    on { print }
+  ' "$1"
+}
+
+comms_summary() { # <file>
+  [ -f "$1" ] || return 0
+  awk '
+    /^## Summary[[:space:]]*$/ { on = 1; next }
+    /^## Log[[:space:]]*$/     { on = 0 }
+    on { print }
+  ' "$1"
+}
+
+# Pick the start date: the latest day before today with any activity.
+if [ -z "$since" ]; then
+  since=$(
+    while IFS=$'\t' read -r key dir _repo; do
+      [ -n "$key" ] && [ -d "$dir" ] || continue
+      entry_dates "$dir/log.md"
+      entry_dates "$dir/comms/comms.md"
+    done < "$TH_INDEX" | awk -v t="$today" '$1 < t' | sort | tail -n 1
+  )
+  [ -n "$since" ] || since="$today"
+fi
+
+material=$(
+  printf 'TODAY: %s\nCOVERING FROM: %s\n' "$today" "$since"
+  while IFS=$'\t' read -r key dir _repo; do
+    [ -n "$key" ] && [ -d "$dir" ] || continue
+    status=""; note=""; updated=""
+    if [ -f "$dir/STATUS.md" ]; then
+      status=$(sed -n 's/^status:[[:space:]]*//p' "$dir/STATUS.md" | head -n 1)
+      note=$(sed -n 's/^note:[[:space:]]*//p' "$dir/STATUS.md" | head -n 1)
+      updated=$(sed -n 's/^updated:[[:space:]]*//p' "$dir/STATUS.md" | head -n 1)
+    fi
+    work=$(entries_since "$dir/log.md" "$since")
+    comms=$(entries_since "$dir/comms/comms.md" "$since")
+    # Skip finished tickets that had no activity in the period.
+    if [ "$status" = "done" ] && [ -z "$work" ] && [ -z "$comms" ]; then continue; fi
+
+    title=""
+    if [ -f "$dir/ticket.md" ]; then
+      title=$(grep -m 1 -E '[^[:space:]]' "$dir/ticket.md" | sed 's/^#*[[:space:]]*//' || true)
+    fi
+    printf '\n=== TICKET %s ===\n' "$key"
+    [ -z "$title" ] || printf 'title: %s\n' "$title"
+    printf 'status: %s (updated %s)\n' "${status:-unknown}" "${updated:-?}"
+    [ -z "$note" ] || printf 'status note: %s\n' "$note"
+
+    printf -- '--- work log since %s ---\n' "$since"
+    if [ -n "$work" ]; then printf '%s\n' "$work"; else printf '(no entries)\n'; fi
+
+    if [ -f "$dir/plan.md" ]; then
+      tasks=$(grep -E '^#{1,6}[[:space:]]+Task[[:space:]]' "$dir/plan.md" || true)
+      if [ -n "$tasks" ]; then printf -- '--- tasks in the plan ---\n%s\n' "$tasks"; fi
+    fi
+
+    summary=$(comms_summary "$dir/comms/comms.md")
+    if printf '%s' "$summary" | grep -Eq '^[^#[:space:]]|^[[:space:]]*[-*] '; then
+      printf -- '--- comms summary ---\n%s\n' "$summary"
+    fi
+    if [ -n "$comms" ]; then
+      printf -- '--- messages since %s ---\n%s\n' "$since" "$comms"
+    fi
+  done < "$TH_INDEX"
+)
+
+if ! printf '%s' "$material" | grep -q '^=== TICKET '; then
+  printf 'Nothing to report: no open tickets and no activity since %s.\n' "$since"
+  exit 0
+fi
+
+if [ "$raw" -eq 1 ]; then
+  printf '%s\n' "$material"
+  exit 0
+fi
+
+need claude
+load_config
+out=$(printf '%s\n' "$material" | claude -p --model "$STANDUP_MODEL" --tools "" \
+      --disallowedTools "mcp__*" --no-session-persistence \
+      --system-prompt-file "$TH_HOME/prompts/standup.md" \
+      "Write my standup update from the material on stdin.") \
+  || die "claude could not write the update. Run 'standup --raw' to see the gathered material."
+
+mkdir -p "$TH_DATA/standups"
+printf '%s\n' "$out" > "$TH_DATA/standups/$today.md"
+printf '%s\n' "$out"
+printf '\n(saved to %s)\n' "$TH_DATA/standups/$today.md" >&2

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Stand-in for herdr used by tests/run.sh. It mimics the JSON shapes and exit
+# codes documented for herdr 0.9.5 and records every call.
+set -euo pipefail
+S="${STUB_DIR:?}"
+mkdir -p "$S"; touch "$S/ws" "$S/panes" "$S/agents" "$S/calls.log"
+printf '%s\n' "$*" >> "$S/calls.log"
+err() { printf '{"error":{"code":"%s"}}\n' "$1" >&2; exit 1; }
+has() { grep -qxF -- "$2" "$1"; }
+
+case "${1:-} ${2:-}" in
+  "--version "*) echo "herdr 0.9.5 (stub)" ;;
+  "workspace list") echo '{"result":{"workspaces":[]}}' ;;
+  "workspace create")
+    n=$(( $(wc -l < "$S/ws") + 1 )); w="w$n"; p="$w:p1"
+    echo "$w" >> "$S/ws"; echo "$p" >> "$S/panes"
+    printf '{"result":{"workspace":{"workspace_id":"%s"},"tab":{"tab_id":"%s:t1"},"root_pane":{"pane_id":"%s"}}}\n' "$w" "$w" "$p" ;;
+  "workspace get") has "$S/ws" "$3" || err workspace_not_found; echo '{"result":{}}' ;;
+  "workspace focus") echo '{"result":{}}' ;;
+  "pane get") has "$S/panes" "$3" || err pane_not_found; echo '{"result":{}}' ;;
+  "pane split")
+    src="$3"; has "$S/panes" "$src" || err pane_not_found
+    w="${src%%:*}"; n=$(( $(grep -c "^$w:" "$S/panes") + 1 )); p="$w:p$n"
+    echo "$p" >> "$S/panes"
+    printf '{"result":{"pane":{"pane_id":"%s"}}}\n' "$p" ;;
+  "agent start")
+    name="$3"; shift 3; pane=""
+    while [ $# -gt 0 ]; do
+      case "$1" in --pane) pane="$2"; shift 2 ;; --) shift; break ;; *) shift ;; esac
+    done
+    has "$S/panes" "$pane" || err pane_not_found
+    printf '%s\n' "$@" > "$S/args-$name"
+    if [ "${STUB_BLOCK_START:-}" = "$name" ]; then
+      printf '%s\t%s\tblocked\n' "$name" "$pane" >> "$S/agents"; err agent_not_ready
+    fi
+    printf '%s\t%s\tidle\n' "$name" "$pane" >> "$S/agents"
+    printf '{"result":{"agent":{"name":"%s"}}}\n' "$name" ;;
+  "agent get")
+    line=$(awk -F'\t' -v n="$3" '$1==n' "$S/agents" | tail -n 1)
+    [ -n "$line" ] || err agent_not_found
+    st=$(printf '%s' "$line" | cut -f3)
+    printf '{"result":{"agent":{"name":"%s","agent_status":"%s"}}}\n' "$3" "$st" ;;
+  "agent prompt")
+    line=$(awk -F'\t' -v n="$3" '$1==n' "$S/agents" | tail -n 1)
+    [ -n "$line" ] || err agent_not_found
+    [ "$(printf '%s' "$line" | cut -f3)" != blocked ] || err agent_blocked
+    printf '%s\n' "$4" >> "$S/prompts-$3"
+    echo '{"result":{"agent":{}}}' ;;
+  "agent focus") echo '{"result":{}}' ;;
+  *) echo "stub herdr: unhandled: $*" >&2; exit 2 ;;
+esac

@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+# ticket: open (or re-open) the herdr workspace for one Jira ticket.
+#
+#   small ticket -> one coder pane (Sonnet)
+#   large ticket -> coder (Sonnet) + lead (Opus) + comms (Haiku)
+#
+# Safe to rerun: it only creates what is missing.
+set -euo pipefail
+
+self="$0"
+while [ -L "$self" ]; do
+  t=$(readlink "$self")
+  case "$t" in /*) self="$t" ;; *) self="$(dirname "$self")/$t" ;; esac
+done
+TH_HOME="$(cd "$(dirname "$self")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$TH_HOME/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ticket <KEY or Jira URL> [--size small|large] [--comms] [--repo PATH] [--no-focus]
+  ticket list
+  ticket doctor
+
+  ticket MLOPS-390               Open the ticket. Sizes it automatically when
+                                 ticket.md is already on disk; otherwise starts
+                                 small and the coder fetches it, then sizes it.
+  ticket MLOPS-390 --size large  Add the lead (Opus) and comms (Haiku) panes.
+  ticket MLOPS-390 --comms       Add only the comms pane to a small ticket.
+  --repo PATH                    Run the sessions in this repo. Default: the git
+                                 repo you are in, or the ticket folder if you are
+                                 not in one. Remembered per ticket; it applies to
+                                 panes started after the change.
+
+Ticket folders are ~/Desktop/tickets/<KEY>/, the same folders the
+ticket-workspace skill writes. Models are set in ~/.ticket-harness/config.env.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+cmd_doctor() {
+  local fail=0 c
+  check() { # <label> <command...>
+    local label="$1"; shift
+    if "$@" >/dev/null 2>&1; then printf '  ok    %s\n' "$label"
+    else printf '  FAIL  %s\n' "$label"; fail=1; fi
+  }
+  printf 'Commands\n'
+  for c in herdr claude jq git ticket-log ticket-comms ticket-dispatch standup; do
+    check "$c is on PATH" command -v "$c"
+  done
+  printf 'Versions\n'
+  printf '  herdr   %s\n' "$(herdr --version 2>/dev/null | head -n 1 || true)"
+  printf '  claude  %s\n' "$(claude --version 2>/dev/null | head -n 1 || true)"
+  printf 'herdr\n'
+  check "herdr server is reachable (start it with: herdr)" herdr workspace list
+  printf '  note  written against the herdr 0.9.5 CLI (agent start, agent prompt)\n'
+  printf '  note  for session restore, run once: herdr integration install claude\n'
+  printf 'Harness files\n'
+  for c in _shared lead coder comms; do
+    check "roles/$c.md" test -f "$TH_HOME/roles/$c.md"
+  done
+  check "prompts/triage.md" test -f "$TH_HOME/prompts/triage.md"
+  check "prompts/standup.md" test -f "$TH_HOME/prompts/standup.md"
+  load_config
+  printf 'Models\n  lead=%s coder=%s comms=%s triage=%s standup=%s\n' \
+    "$LEAD_MODEL" "$CODER_MODEL" "$COMMS_MODEL" "$TRIAGE_MODEL" "$STANDUP_MODEL"
+  if [ "$fail" -eq 0 ]; then printf 'All checks passed.\n'; else printf 'Some checks failed.\n'; fi
+  return "$fail"
+}
+
+cmd_list() {
+  [ -f "$TH_INDEX" ] || { printf 'No tickets yet.\n'; return 0; }
+  local key dir repo st
+  while IFS=$'\t' read -r key dir _repo; do
+    [ -n "$key" ] || continue
+    if [ -f "$dir/STATUS.md" ]; then
+      st=$(sed -n 's/^status:[[:space:]]*//p' "$dir/STATUS.md" | head -n 1)
+    elif [ -d "$dir" ]; then st="?"; else st="(folder missing)"; fi
+    printf '%-14s %-12s %s\n' "$key" "$st" "$dir"
+  done < "$TH_INDEX"
+}
+
+# ---------------------------------------------------------------------------
+# Creates only what is missing. ticket.md and references.md are left to the
+# ticket-workspace skill; everything already in the folder is the user's.
+seed_ticket_dir() {
+  mkdir -p "$TICKET_DIR/files" "$TICKET_DIR/patches" "$TICKET_DIR/scripts" "$TICKET_DIR/comms"
+  if [ ! -f "$TICKET_DIR/log.md" ]; then
+    printf '# %s work log\n\nAppend-only. Entries are added with ticket-log, which stamps the time.\n' "$KEY" > "$TICKET_DIR/log.md"
+  fi
+  if [ ! -f "$TICKET_DIR/STATUS.md" ]; then
+    printf 'status: new\nupdated: %s\nnote: \n' "$(now)" > "$TICKET_DIR/STATUS.md"
+  fi
+  if [ ! -f "$TICKET_DIR/comms/comms.md" ]; then
+    printf '# %s comms\n\n## Summary\n\n### Decisions\n\n### Open\n\n### Promised\n\n## Log\n' "$KEY" > "$TICKET_DIR/comms/comms.md"
+  fi
+  # comms.md holds colleagues' messages; say so if git would pick it up.
+  if git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    case "$TICKET_DIR" in
+      "$REPO"/*)
+        if ! git -C "$REPO" check-ignore -q "$TICKET_DIR" 2>/dev/null; then
+          warn "the ticket folder is inside the repo and not git-ignored: $TICKET_DIR"
+          warn "it will hold Slack and email text, so add it to .gitignore."
+        fi ;;
+    esac
+  fi
+}
+
+triage_size() {
+  local out size
+  out=$(claude -p --model "$TRIAGE_MODEL" --tools "" --disallowedTools "mcp__*" \
+        --no-session-persistence --system-prompt-file "$TH_HOME/prompts/triage.md" \
+        "Classify the ticket on stdin. Answer with one word: small or large." \
+        < "$TICKET_DIR/ticket.md" 2>/dev/null) || out=""
+  size=$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]' | grep -Eo 'small|large' | tail -n 1 || true)
+  if [ -z "$size" ]; then
+    warn "could not size the ticket automatically; starting small. Use --size large to add the lead."
+    size=small
+  fi
+  printf '%s' "$size"
+}
+
+pane_alive() { [ -n "$1" ] && h_ok pane get "$1"; }
+
+ensure_workspace() {
+  local out role alive=0
+  WS=$(state_get "$KEY" WORKSPACE)
+  if [ -n "$WS" ] && h_ok workspace get "$WS"; then
+    for role in coder lead comms; do
+      if pane_alive "$(state_get "$KEY" "PANE_$role")"; then alive=1; fi
+    done
+    if [ "$alive" -eq 1 ]; then return 0; fi
+  fi
+  out=$(herdr workspace create --cwd "$REPO" --label "$KEY" \
+        --env "TICKET_KEY=$KEY" --env "TICKET_DIR=$TICKET_DIR" --env "TICKET_ROLE=coder" \
+        --no-focus) || die "herdr could not create a workspace"
+  WS=$(printf '%s' "$out" | jq -r '.result.workspace.workspace_id // empty')
+  local root
+  root=$(printf '%s' "$out" | jq -r '.result.root_pane.pane_id // empty')
+  if [ -z "$WS" ] || [ -z "$root" ]; then die "unexpected reply from 'herdr workspace create': $out"; fi
+  state_set "$KEY" WORKSPACE "$WS"
+  state_set "$KEY" PANE_coder "$root"
+  state_set "$KEY" PANE_lead ""
+  state_set "$KEY" PANE_comms ""
+  state_set "$KEY" KICK_coder ""
+  state_set "$KEY" KICK_lead ""
+}
+
+# Layout: coder on the left, lead top right, comms bottom right.
+new_pane_for() { # <role> -> pane id
+  local role="$1" src="" dir="" out pane coder lead comms
+  coder=$(state_get "$KEY" PANE_coder)
+  lead=$(state_get "$KEY" PANE_lead)
+  comms=$(state_get "$KEY" PANE_comms)
+  case "$role" in
+    lead)
+      if pane_alive "$coder"; then src="$coder"; dir=right
+      elif pane_alive "$comms"; then src="$comms"; dir=right; fi ;;
+    comms)
+      if pane_alive "$lead"; then src="$lead"; dir=down
+      elif pane_alive "$coder"; then src="$coder"; dir=down; fi ;;
+    coder)
+      if pane_alive "$lead"; then src="$lead"; dir=right
+      elif pane_alive "$comms"; then src="$comms"; dir=right; fi ;;
+  esac
+  [ -n "$src" ] || die "no live pane to split for the $role pane"
+  out=$(herdr pane split "$src" --direction "$dir" --cwd "$REPO" \
+        --env "TICKET_KEY=$KEY" --env "TICKET_DIR=$TICKET_DIR" --env "TICKET_ROLE=$role" \
+        --no-focus) || die "herdr could not split a pane for $role"
+  pane=$(printf '%s' "$out" | jq -r '.result.pane.pane_id // empty')
+  [ -n "$pane" ] || die "unexpected reply from 'herdr pane split': $out"
+  printf '%s' "$pane"
+}
+
+# Returns 0 when the role's agent is running, 1 when it could not be confirmed.
+ensure_role() { # <role>
+  local role="$1" name pane model rolefile err
+  name="$SLUG-$role"
+  if agent_exists "$name"; then return 0; fi
+
+  pane=$(state_get "$KEY" "PANE_$role")
+  if ! pane_alive "$pane"; then
+    pane=$(new_pane_for "$role") || { PENDING=1; return 1; }
+    state_set "$KEY" "PANE_$role" "$pane"
+  fi
+
+  case "$role" in
+    lead)  model="$LEAD_MODEL" ;;
+    coder) model="$CODER_MODEL" ;;
+    comms) model="$COMMS_MODEL" ;;
+  esac
+
+  # Role instructions are appended to Claude Code's own system prompt, so the
+  # session keeps its normal coding guidance and gains the role on top.
+  mkdir -p "$TH_DATA/run"
+  rolefile="$TH_DATA/run/$KEY-$role.md"
+  cat "$TH_HOME/roles/_shared.md" "$TH_HOME/roles/$role.md" > "$rolefile"
+
+  # The helper scripts only write inside the ticket folder (ticket-dispatch
+  # also sends one prompt to the coder), so they are pre-approved.
+  set -- --model "$model" --append-system-prompt-file "$rolefile" --name "$KEY $role"
+  # The ticket folder sits outside the repo, so give the session access to it.
+  if [ "$REPO" != "$TICKET_DIR" ]; then set -- "$@" --add-dir "$TICKET_DIR"; fi
+  set -- "$@" --allowedTools "Bash(ticket-log *)" "Bash(ticket-comms *)"
+  if [ "$role" = lead ]; then set -- "$@" "Bash(ticket-dispatch *)"; fi
+
+  if err=$(herdr agent start "$name" --kind claude --pane "$pane" --timeout 60000 -- "$@" 2>&1 >/dev/null); then
+    printf '  started %-6s %s  (%s, pane %s)\n' "$role" "$name" "$model" "$pane"
+    return 0
+  fi
+  warn "could not confirm that $name is ready (pane $pane)."
+  [ -z "$err" ] || warn "herdr said: $err"
+  warn "Look at that pane, answer any startup question there, then rerun: ticket $KEY"
+  PENDING=1
+  return 1
+}
+
+# Send the opening prompt once per role.
+kick() { # <role> <text>
+  local role="$1" text="$2" name="$SLUG-$1"
+  [ "$(state_get "$KEY" "KICK_$role")" = 1 ] && return 0
+  agent_exists "$name" || return 0
+  if herdr agent prompt "$name" "$text" >/dev/null 2>&1; then
+    state_set "$KEY" "KICK_$role" 1
+  else
+    warn "could not send the opening prompt to $name. It may be waiting on a question in its pane."
+    warn "Answer it, then rerun: ticket $KEY"
+    PENDING=1
+  fi
+}
+
+update_index() {
+  local tmp="$TH_INDEX.tmp.$$"
+  mkdir -p "$TH_DATA"
+  {
+    if [ -f "$TH_INDEX" ]; then awk -F'\t' -v k="$KEY" '$1!=k' "$TH_INDEX"; fi
+    printf '%s\t%s\t%s\n' "$KEY" "$TICKET_DIR" "$REPO"
+  } > "$tmp"
+  mv "$tmp" "$TH_INDEX"
+}
+
+cmd_open() {
+  KEY=$(key_from_arg "$1"); shift
+  [ -n "$KEY" ] || die "could not find a ticket key in that URL"
+  local size_flag="" want_comms=0 repo_flag="" focus=1 prev_size size_note=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --size)     [ $# -ge 2 ] || die "--size needs small or large"; size_flag="$2"; shift 2 ;;
+      --comms)    want_comms=1; shift ;;
+      --repo)     [ $# -ge 2 ] || die "--repo needs a path"; repo_flag="$2"; shift 2 ;;
+      --no-focus) focus=0; shift ;;
+      *) die "unknown option: $1 (see: ticket --help)" ;;
+    esac
+  done
+  case "$size_flag" in ""|small|large) ;; *) die "--size must be small or large" ;; esac
+
+  valid_key "$KEY" || die "'$KEY' does not look like a Jira key (expected e.g. PROJ-123)"
+  SLUG=$(slug_of "$KEY")
+  [ ${#SLUG} -le 26 ] || die "ticket key is too long for herdr agent names"
+  need herdr; need jq; need claude
+  load_config
+  herdr workspace list >/dev/null 2>&1 || die "the herdr server is not reachable. Start herdr first (run: herdr)."
+
+  TICKET_DIR=$(state_get "$KEY" TICKET_DIR)
+  if [ -z "$TICKET_DIR" ] || [ ! -d "$TICKET_DIR" ]; then
+    TICKET_DIR="$(resolve_root)/$KEY"
+  fi
+  mkdir -p "$TICKET_DIR"
+
+  # Working directory: flag, then last time, then the git repo you are in, then
+  # the ticket folder itself (grants, policies and other work with no repo).
+  if [ -n "$repo_flag" ]; then
+    [ -d "$repo_flag" ] || die "not a directory: $repo_flag"
+    REPO=$(git_top "$repo_flag" || (cd "$repo_flag" && pwd))
+  else
+    REPO=$(state_get "$KEY" REPO)
+    if [ -z "$REPO" ] || [ ! -d "$REPO" ]; then
+      REPO=$(git_top "$PWD" || printf '%s' "$TICKET_DIR")
+    fi
+  fi
+  seed_ticket_dir
+  state_set "$KEY" REPO "$REPO"
+  state_set "$KEY" TICKET_DIR "$TICKET_DIR"
+
+  # Size: flag, then last time, then Haiku if the ticket is on disk, else small.
+  prev_size=$(state_get "$KEY" SIZE)
+  SIZE="$size_flag"
+  [ -n "$SIZE" ] || SIZE="$prev_size"
+  if [ -z "$SIZE" ]; then
+    if [ -f "$TICKET_DIR/ticket.md" ]; then
+      SIZE=$(triage_size)
+      size_note="sized by $TRIAGE_MODEL from ticket.md"
+    else
+      SIZE=small
+      size_note="ticket not on disk yet; the coder fetches it, then sizes it"
+    fi
+  fi
+  if [ "$prev_size" = large ] && [ "$SIZE" = small ]; then
+    SIZE=large
+    size_note="already large; panes are kept"
+  fi
+  state_set "$KEY" SIZE "$SIZE"
+  if [ "$want_comms" -eq 1 ]; then state_set "$KEY" COMMS 1; fi
+
+  printf '%s  (%s%s)\n' "$KEY" "$SIZE" "${size_note:+: $size_note}"
+  printf '  folder  %s\n' "$TICKET_DIR"
+  if [ "$REPO" != "$TICKET_DIR" ]; then printf '  works in %s\n' "$REPO"; fi
+
+  PENDING=0
+  ensure_workspace
+  ensure_role coder || true
+  if [ "$SIZE" = large ]; then
+    ensure_role lead || true
+    ensure_role comms || true
+  elif [ "$(state_get "$KEY" COMMS)" = 1 ]; then
+    ensure_role comms || true
+  fi
+
+  if [ "$SIZE" = large ]; then
+    if [ "$(state_get "$KEY" KICK_coder)" = 1 ]; then
+      kick lead "Ticket $KEY. You are the lead. Ticket folder: $TICKET_DIR. The coder ($SLUG-coder) already started this ticket on its own and recommended a full plan, so read log.md first. Then follow your role instructions from intake onward, and talk the approach through with me before writing the plan."
+    else
+      kick lead "Ticket $KEY. You are the lead. Ticket folder: $TICKET_DIR. The coder is $SLUG-coder. Follow your role instructions from intake onward, and talk the approach through with me before writing the plan."
+    fi
+  else
+    kick coder "Ticket $KEY, solo mode. Ticket folder: $TICKET_DIR. Follow the solo mode steps in your role instructions, starting with getting the ticket on disk."
+  fi
+
+  update_index
+
+  if [ "$focus" -eq 1 ]; then
+    herdr workspace focus "$WS" >/dev/null 2>&1 || true
+    if [ "$SIZE" = large ]; then herdr agent focus "$SLUG-lead" >/dev/null 2>&1 || true
+    else herdr agent focus "$SLUG-coder" >/dev/null 2>&1 || true; fi
+  fi
+
+  if [ "$PENDING" -eq 1 ]; then
+    printf 'Not everything started. See the messages above, then rerun: ticket %s\n' "$KEY"
+    return 1
+  fi
+  printf 'Ready. Workspace %s.\n' "$WS"
+}
+
+# ---------------------------------------------------------------------------
+case "${1:-}" in
+  ""|-h|--help|help) usage ;;
+  doctor) cmd_doctor ;;
+  list)   cmd_list ;;
+  -*)     die "unknown option: $1 (see: ticket --help)" ;;
+  *)      cmd_open "$@" ;;
+esac

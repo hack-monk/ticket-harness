@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# ticket-comms: record a Slack message or email in the ticket's comms file.
+# Entries are append-only and stamped by the script. The Summary section at
+# the top of comms.md is edited by the comms agent directly.
+set -euo pipefail
+
+self="$0"
+while [ -L "$self" ]; do
+  t=$(readlink "$self")
+  case "$t" in /*) self="$t" ;; *) self="$(dirname "$self")/$t" ;; esac
+done
+TH_HOME="$(cd "$(dirname "$self")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$TH_HOME/lib/common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ticket-comms <received|draft|sent> "<channel>" "<who>" [--link URL]   (message text on stdin)
+
+  received   a message someone sent you
+  draft      wording prepared for you; not confirmed sent
+  sent       the final wording you confirmed you sent
+
+Options:
+  --link <URL>      Thread or message link
+  --ticket <KEY>    Ticket to write to (default: $TICKET_KEY)
+
+Example:
+  ticket-comms received "Slack #data-platform" "Priya" --link https://... <<'MSG'
+  Use a service principal for this, not a personal token.
+  MSG
+EOF
+}
+
+link=""
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --link)   [ $# -ge 2 ] || die "--link needs a value"; link="$2"; shift 2 ;;
+    --ticket) [ $# -ge 2 ] || die "--ticket needs a value"; TICKET_KEY="$2"; TICKET_DIR=""; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+
+[ ${#args[@]} -ge 3 ] || { usage >&2; exit 2; }
+kind="${args[0]}"
+channel=$(printf '%s' "${args[1]}" | tr '\n' ' ')
+who=$(printf '%s' "${args[2]}" | tr '\n' ' ')
+
+case "$kind" in
+  received) label="RECEIVED" ;;
+  draft)    label="DRAFT (not confirmed sent)" ;;
+  sent)     label="SENT" ;;
+  *) die "first argument must be received, draft, or sent" ;;
+esac
+
+ticket_ctx
+
+body=""
+if [ ${#args[@]} -ge 4 ]; then
+  body="${args[3]}"
+elif [ ! -t 0 ]; then
+  body=$(cat)
+fi
+[ -n "$body" ] || die "no message text given (pass it on stdin)"
+
+file="$TICKET_DIR/comms/comms.md"
+mkdir -p "$TICKET_DIR/comms"
+if [ ! -f "$file" ]; then
+  printf '# %s comms\n\n## Summary\n\n### Decisions\n\n### Open\n\n### Promised\n\n## Log\n' "$TICKET_KEY" > "$file"
+fi
+
+{
+  printf '\n### %s · %s · %s · %s\n\n' "$(now)" "$channel" "$label" "$who"
+  printf '%s\n' "$body" | sed 's/^/> /'
+  if [ -n "$link" ]; then printf '\nLink: %s\n' "$link"; fi
+} >> "$file"
+printf 'recorded: %s %s (%s)\n' "$kind" "$channel" "$who"
